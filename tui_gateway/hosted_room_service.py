@@ -57,6 +57,30 @@ _OWED_REVOKE_MAX_RETRY_SECONDS = 3600.0
 logger = logging.getLogger(__name__)
 
 
+def _hosted_room_bindings_store_stat(db_path) -> tuple | None:
+    """Snapshot of the hosted-room store's DB + WAL + SHM metadata.
+
+    Used to detect an unchanged empty store without opening SQLite. Returns None
+    when the database file itself is missing (so the first open can create it).
+    Any change in identity, size, mtime or ctime invalidates a cached empty result.
+    """
+    base = Path(db_path)
+    entries = []
+    for path in (base, Path(str(base) + "-wal"), Path(str(base) + "-shm")):
+        try:
+            st = path.stat()
+        except OSError:
+            entries.append(None)
+            continue
+        ctime_ns = getattr(st, "st_ctime_ns", None)
+        if ctime_ns is None:
+            ctime_ns = int(st.st_ctime * 1_000_000_000)
+        entries.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, ctime_ns))
+    if entries[0] is None:
+        return None
+    return tuple(entries)
+
+
 class RoomDisbandRefusedError(hosted_rooms.HostedRoomError, RuntimeError):
     """An expected Disband refusal shared by both RPC surfaces."""
 
@@ -182,6 +206,12 @@ class HostedRoomService:
         # lock: nothing is called while holding it, so Desktop's room status never waits behind a
         # room's preparation, which holds ``_policy_lock`` across its log and checkpoint work.
         self._state_lock = threading.Lock()
+        # Cache for an unchanged empty hosted-room binding list, avoiding repeated SQLite
+        # opens on idle supervisor polls (see issue #134619). Only an empty result is cached;
+        # any store metadata change invalidates it.
+        self._bindings_empty_lock = threading.Lock()
+        self._bindings_empty_cached = False
+        self._bindings_empty_stat = None
         self.policy_checkpoint = HostedRoomPolicyCheckpoint(
             self.db_path,
             # Every Continue grants one more budget, so one discussion's projection holds up to that many.
@@ -276,10 +306,26 @@ class HostedRoomService:
 
     def bindings(self) -> tuple[HostedRoomBinding, ...]:
         local_gateway_id = hosted_rooms.local_authority_gateway_id()
-        return tuple(
+        stat_before = _hosted_room_bindings_store_stat(self.db_path)
+        with self._bindings_empty_lock:
+            cached = self._bindings_empty_cached
+            cached_stat = self._bindings_empty_stat
+        if cached and stat_before is not None and cached_stat == stat_before:
+            return ()
+        rooms = hosted_rooms.list_rooms(self.db_path)
+        result = tuple(
             HostedRoomBinding(str(room["room_id"]), *_authority(room))
-            for room in hosted_rooms.list_rooms(self.db_path)
+            for room in rooms
             if str(room["authority_gateway_id"]) == local_gateway_id)
+        stat_after = _hosted_room_bindings_store_stat(self.db_path)
+        with self._bindings_empty_lock:
+            if not result and stat_before is not None and stat_before == stat_after:
+                self._bindings_empty_cached = True
+                self._bindings_empty_stat = stat_after
+            else:
+                self._bindings_empty_cached = False
+                self._bindings_empty_stat = None
+        return result
 
     def _room(self, room_id: str) -> dict[str, Any]:
         return hosted_rooms.room_state(self.db_path, room_id=room_id)
